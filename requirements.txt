@@ -1,0 +1,6 @@
+numpy
+opencv-python
+scipy
+# yalnız --lama ve testlerdeki sahte model için:
+torch
+pytest

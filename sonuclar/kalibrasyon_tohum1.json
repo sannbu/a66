@@ -1,0 +1,30 @@
+{
+ "kappa": 0.5,
+ "t_iyi": 2.0,
+ "t_kotu": 2.3,
+ "olusturma": {
+  "ciftler": [
+   "C:/irdata/v4bench/zemin_sabit_s1:C:/irdata/v4bench/out_zemin_sabit_s1",
+   "C:/irdata/v4bench/zemin_salinim_s1:C:/irdata/v4bench/out_zemin_salinim_s1",
+   "C:/irdata/v4bench/zemin_pan_s1:C:/irdata/v4bench/out_zemin_pan_s1",
+   "C:/irdata/v4bench/zemin_donme_s1:C:/irdata/v4bench/out_zemin_donme_s1",
+   "C:/irdata/v4bench/zemin_zoom_s1:C:/irdata/v4bench/out_zemin_zoom_s1",
+   "C:/irdata/v4bench/zemin_hizli_s1:C:/irdata/v4bench/out_zemin_hizli_s1",
+   "C:/irdata/v4bench/gok_sabit_s1:C:/irdata/v4bench/out_gok_sabit_s1",
+   "C:/irdata/v4bench/karma_sabit_s1:C:/irdata/v4bench/out_karma_sabit_s1",
+   "C:/irdata/v4bench/gok_salinim_s1:C:/irdata/v4bench/out_gok_salinim_s1"
+  ],
+  "tarih": "2026-11-11 00:05",
+  "kisitlar": {
+   "P(gercek kotu | karar iyi)": "<= 0.03",
+   "P(karar kotu | gercek kotu)": ">= 0.75"
+  },
+  "ulasilan": {
+   "P(gercek kotu | karar iyi)": 0.01661631419939577,
+   "P(gercek iyi degil | karar iyi)": 0.34365558912386707,
+   "P(karar kotu | gercek kotu)": 0.9286573146292585,
+   "P(karar iyi | gercek kotu)": 0.008817635270541082,
+   "P(karar iyi | gercek iyi)": 0.497424155695478
+  }
+ }
+}
