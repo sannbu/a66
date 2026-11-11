@@ -425,3 +425,73 @@ def test_defect_foreign_content(accepted):
     foreign[ys, xs] = full[cy0 + ys + shift_y, cx0 + xs]
     signals = reassess(solver, solved, final=foreign)
     assert category(params, signals) != "iyi"
+
+
+# 13 ---------------------------------------------------------------- denetimde bulunan açıklar
+
+def strict_errors(bench, out):
+    """e_true'yu görünürlük payından bağımsız, yalnız gerçek gürültüye göre verir."""
+    rows = v4.true_errors(bench, out)
+    summary = json.loads((Path(out) / "ozet.json").read_text(encoding="utf-8"))
+    sigma = json.loads((Path(bench) / "truth.json").read_text())["sigma"]
+    scale = max(sigma, summary["argumanlar"]["visible_fraction"] * summary["diziler"][0]["aralik"]) / sigma
+    return [dict(r, e_true=r["e_true"] * scale) for r in rows]
+
+
+def test_rerun_into_same_folder_leaves_no_stale_files(tmp_path):
+    bench = make(tmp_path, "b", frames=30)
+    out = tmp_path / "o"
+    run(bench, out)
+    run(bench, out, "--thresholds", "0.1,0.2")
+    names = [p.name for c in v4.CATEGORIES for p in (out / c).glob("*.tiff")]
+    assert len(names) == len(set(names)) == 30
+    folders = {r["frame"]: r["folder"] for r in csv.DictReader(open(out / "kareler.csv", encoding="utf-8"))}
+    for name, folder in folders.items():
+        assert (out / folder / f"bg_{name}").exists()
+
+
+def test_skip_unremovable(tmp_path):
+    bench = make(tmp_path, "b", frames=40, objects=[fast_object(), still_object()])
+    plain, skip = tmp_path / "plain", tmp_path / "skip"
+    summary = run(bench, plain)
+    assert summary["kareler"] == {"kotu": 40} and summary["yalniz_cikmayan_obje_yuzunden_kotu_kare"] > 0
+    summary = run(bench, skip, "--skip-unremovable")
+    assert summary["kareler"].get("kotu", 0) < 40
+    for r in rows_of(skip):
+        if r["reason"] != "kaynak_yok":
+            continue
+        assert r["skipped"] == "1" and r["category"] == "kotu"
+        original = v4.read_image(bench / v4.FRAMES_SUBDIR / r["frame"])
+        result = v4.read_image(v4.find_output(skip, r["frame"]))
+        confidence = v4.read_image(skip / "guven" / f"{Path(r['frame']).stem}.png")
+        box = tuple(slice(int(r[a]), int(r[b])) for a, b in (("hole_y0", "hole_y1"), ("hole_x0", "hole_x1")))
+        assert np.array_equal(result[box], original[box]) and (confidence[box] == 0).all()
+
+
+def test_noise_estimate_with_moving_camera(tmp_path):
+    """Kesirli kamera kayması dokuyu gürültü gibi göstermemeli (gerçek 5,5; sabit desenle en çok ~6)."""
+    cameras = {"salinim": lambda t: (9 * math.sin(2 * math.pi * t / 40), 2.7 * math.sin(2 * math.pi * t / 40), 0.0, 1.0),
+               "pan": lambda t: (0.27 * t, 0.0, 0.0, 1.0)}
+    for name, camera in cameras.items():
+        bench = make(tmp_path, name, frames=60, camera_fn=camera)
+        info, _, _, _ = build(bench)
+        assert info.camera == "hareketli"
+        assert 4.7 <= info.sigma_t <= 6.6, (name, info.sigma_t)
+
+
+def test_default_settings_never_call_bad_good(tmp_path):
+    """Varsayılan --visible-fraction ile: gerçek gürültüye göre kötü olan dolguya iyi denmez."""
+    cases = {"sabit": None, "salinim": lambda t: (9 * math.sin(2 * math.pi * t / 40), 2.7 * math.sin(2 * math.pi * t / 40), 0.0, 1.0)}
+    for name, camera in cases.items():
+        bench = make(tmp_path, name, frames=60, objects=[fast_object(), still_object()], camera_fn=camera)
+        out = tmp_path / f"o_{name}"
+        v4.main(["--project", str(bench), "--out", str(out), "--workers", "2", "--no-originals"])
+        rows = strict_errors(bench, out)
+        assert any(r["category"] == "iyi" for r in rows), name
+        assert not [r for r in rows if r["category"] == "iyi" and r["e_true"] > 3], name
+
+
+def test_bad_arguments_fail_clearly(tmp_path):
+    bench = make(tmp_path, "b", frames=5)
+    with pytest.raises(SystemExit):
+        run(bench, tmp_path / "o", "--every", "0")

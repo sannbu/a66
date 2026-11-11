@@ -58,6 +58,8 @@ TEX_ORTA, TEX_KOTU = 1.6, 2.5
 FLICKER_ORTA = 2.5
 VISIBLE_FRACTION = 0.005
 NOISE_PAIRS, NOISE_BLOCK, NOISE_QUANTILE = 30, 32, 0.20
+NOISE_MAX_GAP, NOISE_GAP_PENALTY = 12, 0.005
+SUBPIXEL_PREFER, SUBPIXEL_SEARCH = 0.15, 40
 CACHE_BYTES = 300 * 2 ** 20
 
 TIFF_SUFFIXES = (".tif", ".tiff")
@@ -71,7 +73,9 @@ REPORT_COLUMNS = ["frame", "sequence", "object", "label_x0", "label_y0", "label_
                   "hole_x0", "hole_y0", "hole_x1", "hole_y1", "hole_pixels", "rect_pixels", "mode", "n_sources",
                   "gap_near", "gap_far", "one_sided", "unrevealed", "a1", "a2", "a2_coverage", "offset", "leftover",
                   "seam", "texture", "flicker", "e_hat", "category", "reason", "refined", "chain_reliable",
-                  "sigma_t", "sigma_eff"]
+                  "sigma_t", "sigma_eff", "skipped"]
+FRAME_COLUMNS = ["frame", "sequence", "folder", "objects", "iyi", "orta", "kotu", "skipped", "worst_reason"]
+UNREMOVABLE = ("kaynak_yok", "cok_buyuk")
 ALIGN_COLUMNS = ["sequence", "frame", "dx", "dy", "rot_deg", "scale", "corner_px", "n_points", "n_inliers", "reliable"]
 
 
@@ -422,6 +426,7 @@ class SequenceInfo:
         self.sigma_t = 1.0
         self.range = 1.0
         self.sigma_eff = 1.0
+        self.noise_subpixel = 0.0
 
     def M(self, a, b):
         """Kare a koordinatından kare b koordinatına."""
@@ -507,20 +512,57 @@ def prepare_sequence(info, args, log):
     estimate_noise(info, store)
     log[info.name] = {"ad": info.name, "kare": n, "bilinmeyen_kare": info.unknown, "kamera": camera,
                       "hareket_p95_px": round(info.motion_p95, 3), "sigma_t": round(info.sigma_t, 4),
-                      "sigma_eff": round(info.sigma_eff, 4), "aralik": round(info.range, 3)}
+                      "sigma_eff": round(info.sigma_eff, 4), "aralik": round(info.range, 3),
+                      "gurultu_cifti_sapma_px": round(info.noise_subpixel, 3)}
+
+
+def noise_pairs(info):
+    """Gürültü ölçülecek (kare, kaynak kare) çiftleri ve seçilenlerin tam pikselden sapması.
+
+    Sabit kamerada ardışık kareler. Hareketli kamerada kaynak en yakın piksele yuvarlanarak örneklendiği için
+    kesirli kayma dokuyu gürültü gibi gösterir; bu yüzden aradaki dönüşümü tam piksel ötelemeye en yakın olan
+    çiftler (aralık 1..NOISE_MAX_GAP) seçilir."""
+    n, width, height = info.n, info.width, info.height
+    if n < 2:
+        return [], 0.0
+    if info.camera != "hareketli":
+        return [(t, t - 1) for t in sorted({int(round(v)) for v in np.linspace(1, n - 1, min(NOISE_PAIRS, n - 1))})], 0.0
+    corners = np.array([[0, 0, 1], [width, 0, 1], [0, height, 1], [width, height, 1]], np.float64).T
+    candidates = []
+    for gap in range(1, NOISE_MAX_GAP + 1):
+        for t in range(gap, n):
+            if not info.reliable_between(t - gap, t):
+                continue
+            moved = info.M(t, t - gap) @ corners
+            shift = moved[:2] / moved[2] - corners[:2]
+            score = float(np.abs(shift - np.rint(shift.mean(axis=1, keepdims=True))).max())
+            candidates.append((score + NOISE_GAP_PENALTY * gap, score, t, t - gap))
+    candidates.sort()
+    # Aynı kare birden çok çiftte yer almasın: ölçüm dizinin tek bir anına yığılmasın.
+    chosen, seen = [], set()
+    for _, score, t, s in candidates:
+        if t in seen:
+            continue
+        seen.add(t)
+        chosen.append((score, t, s))
+        if len(chosen) == NOISE_PAIRS:
+            break
+    if not chosen:
+        return [], 0.0
+    return [(t, s) for _, t, s in chosen], float(np.median([score for score, _, _ in chosen]))
 
 
 def estimate_noise(info, store):
     n, width, height = info.n, info.width, info.height
     values = []
-    picks = sorted({int(round(v)) for v in np.linspace(1, n - 1, min(NOISE_PAIRS, n - 1))}) if n > 1 else []
+    picks, info.noise_subpixel = noise_pairs(info)
     ys, xs = np.mgrid[:height, :width]
-    for t in picks:
-        current, previous = store.gray(t), store.gray(t - 1)
-        M = info.M(t, t - 1)
+    for t, s in picks:
+        current, previous = store.gray(t), store.gray(s)
+        M = info.M(t, s)
         identity = info.camera != "hareketli" or near_identity(M, (0, 0, width, height))
         sx, sy = map_coords(M, xs.ravel(), ys.ravel(), identity)
-        ok = inside_and_free(sx, sy, info.occ[t - 1], width, height)
+        ok = inside_and_free(sx, sy, info.occ[s], width, height)
         ok &= inside_and_free(xs.ravel(), ys.ravel(), info.occ[t], width, height)
         sample = np.zeros(width * height, np.float32)
         sample[ok] = previous[sy[ok], sx[ok]]
@@ -687,7 +729,7 @@ def decide(s, t_iyi, t_kotu, kappa):
 
 class Source:
     __slots__ = ("t", "side", "distance", "M", "identity", "gray", "raw", "valid", "offset", "artik", "refined",
-                 "ring_ok")
+                 "ring_ok", "round")
 
 
 class RegionSolver:
@@ -803,7 +845,11 @@ class RegionSolver:
         return result
 
     def plan(self, t, R, crop):
-        """Bölüm 6.6: geçmiş ve gelecekten, piksel açıldıkça en yakın kaynaklar."""
+        """Bölüm 6.6: geçmiş ve gelecekten, piksel açıldıkça en yakın kaynaklar.
+
+        Hareketli kamerada önce bölgeye tam piksel ötelemeyle oturan kaynaklar denenir (ilk tur): kaynak en yakın
+        piksele yuvarlanarak kopyalandığı için kesirli kayma dokulu zeminde doğrudan dolgu hatasıdır. Açılmayan
+        pikseller ikinci turda kayması ne olursa olsun en yakın kaynaklardan tamamlanır."""
         info, p = self.info, self.p
         cx0, cy0 = crop[0], crop[1]
         ys, xs = np.nonzero(R)
@@ -812,34 +858,46 @@ class RegionSolver:
         min_gain = max(MIN_GAIN_PIXELS, MIN_GAIN_FRACTION * n)
         remaining = {"gecmis": np.ones(n, bool), "gelecek": np.ones(n, bool)}
         chosen = {"gecmis": [], "gelecek": []}
-        done = {"gecmis": False, "gelecek": False}
         rect = (int(gx.min()), int(gy.min()), int(gx.max()) + 1, int(gy.max()) + 1)
-        for d in range(1, p["search"] + 1):
-            for side, ts in (("gecmis", t - d), ("gelecek", t + d)):
-                if done[side] or ts < 0 or ts >= info.n:
-                    continue
-                M = info.M(t, ts)
-                identity = info.camera != "hareketli" or near_identity(M, rect)
-                sx, sy = map_coords(M, gx, gy, identity)
-                gain = inside_and_free(sx, sy, info.occ[ts], info.width, info.height) & remaining[side]
-                count = int(gain.sum())
-                if count == 0:
-                    continue
-                left = int(remaining[side].sum())
-                if count == left or (count >= min_gain and len(chosen[side]) < MAX_SOURCES_PER_SIDE - 1):
-                    src = Source()
-                    src.t, src.side, src.distance, src.M, src.identity = ts, side, d, M, identity
-                    src.refined = False
-                    chosen[side].append(src)
-                    remaining[side] &= ~gain
-                    if not remaining[side].any():
-                        done[side] = True
-            past_over = done["gecmis"] or t - d <= 0
-            future_over = done["gelecek"] or t + d >= info.n - 1
-            if past_over and future_over:
-                break
+        corners = np.array([[rect[0], rect[1], 1], [rect[2], rect[1], 1], [rect[0], rect[3], 1],
+                            [rect[2], rect[3], 1]], np.float64).T
+        moving = info.camera == "hareketli"
+        taken = set()
+        for round_index, (limit, reach) in enumerate(((SUBPIXEL_PREFER, SUBPIXEL_SEARCH), (None, p["search"]))
+                                                     if moving else ((None, p["search"]),)):
+            done = {side: not remaining[side].any() for side in remaining}
+            for d in range(1, min(reach, p["search"]) + 1):
+                for side, ts in (("gecmis", t - d), ("gelecek", t + d)):
+                    if done[side] or ts < 0 or ts >= info.n or ts in taken:
+                        continue
+                    M = info.M(t, ts)
+                    if limit is not None:
+                        moved = M @ corners
+                        shift = moved[:2] / moved[2] - corners[:2]
+                        if np.abs(shift - np.rint(shift.mean(axis=1, keepdims=True))).max() > limit:
+                            continue
+                    identity = not moving or near_identity(M, rect)
+                    sx, sy = map_coords(M, gx, gy, identity)
+                    gain = inside_and_free(sx, sy, info.occ[ts], info.width, info.height) & remaining[side]
+                    count = int(gain.sum())
+                    if count == 0:
+                        continue
+                    left = int(remaining[side].sum())
+                    if count == left or (count >= min_gain and len(chosen[side]) < MAX_SOURCES_PER_SIDE - 1):
+                        src = Source()
+                        src.t, src.side, src.distance, src.M, src.identity = ts, side, d, M, identity
+                        src.refined, src.round = False, round_index
+                        chosen[side].append(src)
+                        taken.add(ts)
+                        remaining[side] &= ~gain
+                        if not remaining[side].any():
+                            done[side] = True
+                past_over = done["gecmis"] or t - d <= 0
+                future_over = done["gelecek"] or t + d >= info.n - 1
+                if past_over and future_over:
+                    break
         sources = chosen["gecmis"] + chosen["gelecek"]
-        sources.sort(key=lambda s: (s.distance, s.side != "gecmis"))
+        sources.sort(key=lambda s: (s.round, s.distance, s.side != "gecmis"))
         return sources
 
     def finish_source(self, t, src, crop, ring, rect_global, others):
@@ -1194,6 +1252,11 @@ def process_frame(info, store, solver, t, params, prev):
         else:
             signals.setdefault("flicker", None)
         category, reason, e_hat = decide(signals, params["t_iyi"], params["t_kotu"], params["kappa"])
+        skipped = bool(params.get("skip_unremovable")) and reason in UNREMOVABLE
+        if skipped:
+            # Arka planı hiçbir karede görünmeyen obje: pikselleri olduğu gibi kalır, kare klasörünü belirlemez.
+            result[H_global] = raw[H_global]
+            hole_all &= ~H_global
         # KARAR: çok büyük bölgede pikseller değişmez ama güven haritasında bölge 0 işaretlenir (obje duruyor).
         confidence[H_global] = np.minimum(confidence[H_global], CONFIDENCE[category])
         drawn.append((H_global, rect, signals.get("mode", ""), reason, category))
@@ -1214,8 +1277,9 @@ def process_frame(info, store, solver, t, params, prev):
                 "leftover": signals.get("leftover"), "seam": signals.get("seam"), "texture": signals.get("texture"),
                 "flicker": signals.get("flicker"), "e_hat": e_hat, "category": category, "reason": reason,
                 "refined": signals.get("refined"), "chain_reliable": signals.get("chain_reliable"),
-                "sigma_t": info.sigma_t, "sigma_eff": info.sigma_eff})
-    frame_category = max((r["category"] for r in rows), key=CATEGORIES.index) if rows else "iyi"
+                "sigma_t": info.sigma_t, "sigma_eff": info.sigma_eff, "skipped": int(skipped)})
+    counted = [r["category"] for r in rows if not r["skipped"]] or [r["category"] for r in rows]
+    frame_category = max(counted, key=CATEGORIES.index) if counted else "iyi"
     return result, rows, frame_category, confidence, drawn, hole_all
 
 
@@ -1299,6 +1363,16 @@ def load_labels(args, frames, width, height):
     return load_coco(args.images_json, args.annotations_json, frames, width, height, args.missing_labels)
 
 
+def clean_previous(out):
+    """Aynı klasöre önceki koşunun yazdığı dosyaları siler; yoksa kategori değiştiren kare iki klasörde kalır.
+    Yalnız bu programın yazdığı adlar silinir: kategori klasörlerinde bg_*, guven/ ve onizleme/ içinde *.png."""
+    stale = [p for c in CATEGORIES for p in (out / c).glob("bg_*") if p.is_file()]
+    stale += [p for sub in ("guven", "onizleme") for p in (out / sub).glob("*.png") if p.is_file()]
+    for p in stale:
+        p.unlink()
+    return len(stale)
+
+
 def run(args):
     started = time.time()
     if args.project:
@@ -1320,14 +1394,20 @@ def run(args):
     boxes = load_labels(args, frames, width, height)
     if all(b is None for b in boxes):
         raise ValueError("Hiçbir kare etiket kaynağıyla eşleşmedi")
+    if args.every < 1 or args.workers < 1:
+        raise SystemExit("--every ve --workers en az 1 olmalı")
     out = Path(args.out)
     for sub in CATEGORIES + ("onizleme", "guven") + (() if args.no_originals else ("silinmemis",)):
         (out / sub).mkdir(parents=True, exist_ok=True)
+    removed = clean_previous(out)
+    if removed:
+        print(f"Önceki koşudan kalan {removed} çıktı dosyası silindi: {out}")
     params = {"search": args.search, "every": args.every, "t_iyi": t_iyi, "t_kotu": t_kotu, "kappa": kappa,
               "lama": args.lama, "lama_device": args.lama_device, "out": str(out), "preview_every": args.preview_every,
-              "originals": not args.no_originals, "visible_fraction": args.visible_fraction}
+              "originals": not args.no_originals, "visible_fraction": args.visible_fraction,
+              "skip_unremovable": args.skip_unremovable}
     log = {}
-    all_records, align_rows = [], []
+    all_records, align_rows, info_frames = [], [], {}
     with ProcessPoolExecutor(args.workers) as pool:
         futures = []
         for name, seq_frames, seq_boxes, unknown in split_sequences(frames, boxes):
@@ -1337,6 +1417,7 @@ def run(args):
             info.visible_fraction = args.visible_fraction
             prepare_sequence(info, args, log)
             align_rows.extend(info.align_rows)
+            info_frames[name] = info.frames
             print(f"{name}: {info.n} kare, kamera {info.camera}, sigma_t {info.sigma_t:.3f}, "
                   f"sigma_eff {info.sigma_eff:.3f}", flush=True)
             indices = list(range(0, info.n, args.every))
@@ -1360,6 +1441,21 @@ def run(args):
         writer.writerow(ALIGN_COLUMNS)
         writer.writerows(align_rows)
     objects = [row for _, _, _, rows in all_records for row in rows]
+    blocked = 0
+    with open(out / "kareler.csv", "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(FRAME_COLUMNS)
+        for name, t, category, rows in all_records:
+            count = Counter(r["category"] for r in rows)
+            worst = max(rows, key=lambda r: CATEGORIES.index(r["category"]))["reason"] if rows else ""
+            rest = [r["category"] for r in rows if r["reason"] not in UNREMOVABLE]
+            if category == "kotu" and rest and "kotu" not in rest and not any(r["skipped"] for r in rows):
+                blocked += 1
+            writer.writerow([Path(info_frames[name][t]).name, name, category, len(rows), count["iyi"], count["orta"],
+                             count["kotu"], sum(r["skipped"] for r in rows), worst])
+    if blocked:
+        print(f"UYARI: {blocked} kare yalnız arka planı hiç görünmeyen bir obje yüzünden kotu/ klasöründe; "
+              f"bu objeleri saymamak için --skip-unremovable kullanılabilir.")
     elapsed = time.time() - started
     summary = {
         "surum": "v4",
@@ -1371,6 +1467,7 @@ def run(args):
         "objeler": dict(Counter(r["category"] for r in objects)),
         "nedenler": dict(Counter(r["reason"] for r in objects)),
         "modlar": dict(Counter(r["mode"] for r in objects)),
+        "yalniz_cikmayan_obje_yuzunden_kotu_kare": blocked,
         "sure_sn": round(elapsed, 1),
         "saniye_obje": round(elapsed * args.workers / max(1, len(objects)), 3),
     }
@@ -1403,6 +1500,9 @@ def main_parser():
     parser.add_argument("--workers", type=int, default=4, help="süreç sayısı")
     parser.add_argument("--preview-every", type=int, default=0, help="her N karede bir önizleme, 0 kapalı")
     parser.add_argument("--no-originals", action="store_true", help="silinmemis/ yazma")
+    parser.add_argument("--skip-unremovable", action="store_true",
+                        help="arka planı hiç görünmeyen (kaynak_yok, cok_buyuk) objeye dokunma ve kare klasörünü "
+                             "belirlerken sayma; güven haritasında yine 0 işaretlenir")
     return parser
 
 
